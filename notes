@@ -1,0 +1,248 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+DB="${1:-$(dirname "$0")/notes.db}"
+
+if [[ ! -f "$DB" ]]; then
+  echo "Base introuvable : $DB"
+  exit 1
+fi
+
+query() {
+  sqlite3 "$DB" "$1"
+}
+
+# Affiche une note avec glow, pager adaptatif si contenu long
+render_note() {
+  local title="$1" content="$2" tags="$3" dates="$4"
+
+  local rendered
+  rendered=$(echo "# $title
+> $tags | $dates
+
+---
+
+$content" | glow -)
+
+  local content_lines
+  content_lines=$(echo "$rendered" | wc -l)
+  local available=$(( $(tput lines) - 4 ))
+
+  if [[ $content_lines -gt $available ]]; then
+    echo "$rendered" | gum pager
+  else
+    echo "$rendered"
+  fi
+}
+
+list_notes() {
+  local where="1=1"
+
+  if [[ -n "${1:-}" ]]; then
+    where="t.name = '$1'"
+  fi
+
+  local notes
+  notes=$(query "
+    SELECT n.id || ' | ' || n.title || ' #' || COALESCE(t.name, '-')
+    FROM notes n
+    LEFT JOIN note_tags nt ON n.id = nt.note_id
+    LEFT JOIN tags t ON nt.tag_id = t.id
+    WHERE $where
+    ORDER BY n.id;
+  ")
+
+  if [[ -z "$notes" ]]; then
+    gum style --foreground 208 "Aucune note trouvée."
+    return
+  fi
+
+  local choice
+  choice=$(echo "$notes" | gum filter --placeholder "Chercher une note...") || return
+
+  local id="${choice%% |*}"
+  show_note "$id"
+}
+
+show_note() {
+  local id="$1"
+
+  local title content tags created_at
+  title=$(query "SELECT title FROM notes WHERE id = $id;")
+  content=$(query "SELECT content FROM notes WHERE id = $id;")
+  tags=$(query "
+    SELECT COALESCE('#' || GROUP_CONCAT(t.name, ' #'), '-')
+    FROM tags t JOIN note_tags nt ON t.id = nt.tag_id
+    WHERE nt.note_id = $id;
+  ")
+  created_at=$(query "SELECT created_at FROM notes WHERE id = $id;")
+
+  render_note "$title" "$content" "$tags" "Créée: $created_at"
+
+  echo ""
+  local action
+  action=$(gum choose "Retour" "Quitter") || return
+  [[ "$action" == "Quitter" ]] && exit 0
+}
+
+search_notes() {
+  local term
+  term=$(gum input --placeholder "Rechercher dans les notes...") || return
+  [[ -z "$term" ]] && return
+
+  local escaped_term
+  escaped_term=$(echo "$term" | sed "s/'/''/g")
+
+  local results
+  results=$(query "
+    SELECT n.id || ' | ' || n.title || ' #' || COALESCE(t.name, '-')
+    FROM notes n
+    LEFT JOIN note_tags nt ON n.id = nt.note_id
+    LEFT JOIN tags t ON nt.tag_id = t.id
+    WHERE n.title LIKE '%$escaped_term%' OR n.content LIKE '%$escaped_term%'
+    ORDER BY n.id;
+  ")
+
+  if [[ -z "$results" ]]; then
+    gum style --foreground 208 "Aucun résultat pour \"$term\"."
+    return
+  fi
+
+  local choice
+  choice=$(echo "$results" | gum filter --placeholder "Résultats...") || return
+
+  local id="${choice%% |*}"
+  show_note "$id"
+}
+
+filter_by_tag() {
+  local tags
+  tags=$(query "SELECT name FROM tags ORDER BY name;")
+
+  if [[ -z "$tags" ]]; then
+    gum style --foreground 208 "Aucun tag."
+    return
+  fi
+
+  local selected
+  selected=$(echo "$tags" | gum choose --no-limit --header "Filtrer par tags (espace pour sélectionner) :") || return
+  [[ -z "$selected" ]] && return
+
+  local in_clause=""
+  while IFS= read -r tag; do
+    [[ -n "$in_clause" ]] && in_clause="$in_clause, "
+    in_clause="$in_clause'$tag'"
+  done <<< "$selected"
+
+  local notes
+  notes=$(query "
+    SELECT DISTINCT n.id || ' | ' || n.title || ' #' || COALESCE(GROUP_CONCAT(t.name, ' #'), '-')
+    FROM notes n
+    LEFT JOIN note_tags nt ON n.id = nt.note_id
+    LEFT JOIN tags t ON nt.tag_id = t.id
+    WHERE t.name IN ($in_clause)
+    GROUP BY n.id
+    ORDER BY n.id;
+  ")
+
+  if [[ -z "$notes" ]]; then
+    gum style --foreground 208 "Aucune note trouvée."
+    return
+  fi
+
+  local choice
+  choice=$(echo "$notes" | gum filter --placeholder "Chercher une note...") || return
+
+  local id="${choice%% |*}"
+  show_note "$id"
+}
+
+browse_notes() {
+  local ids title content tags created_at updated_at
+  local dates nav rendered content_lines available hints key
+  ids=$(query "SELECT id FROM notes ORDER BY id;")
+
+  if [[ -z "$ids" ]]; then
+    gum style --foreground 208 "Aucune note."
+    return
+  fi
+
+  local -a id_list=( ${(f)ids} )
+  local total=${#id_list[@]}
+  local idx=1
+
+  while true; do
+    title=$(query "SELECT title FROM notes WHERE id = ${id_list[$idx]};")
+    content=$(query "SELECT content FROM notes WHERE id = ${id_list[$idx]};")
+    tags=$(query "
+      SELECT COALESCE('#' || GROUP_CONCAT(t.name, ' #'), '-')
+      FROM tags t JOIN note_tags nt ON t.id = nt.tag_id
+      WHERE nt.note_id = ${id_list[$idx]};
+    ")
+    created_at=$(query "SELECT created_at FROM notes WHERE id = ${id_list[$idx]};")
+    updated_at=$(query "SELECT updated_at FROM notes WHERE id = ${id_list[$idx]};")
+
+    dates="Créée: $created_at"
+    if [[ "$updated_at" != "$created_at" ]]; then
+      dates+="  |  Modifiée: $updated_at"
+    fi
+
+    nav="[$idx/$total]  id:${id_list[$idx]}"
+
+    clear
+
+    # Nav
+    gum style --foreground 245 --align center --width "$(tput cols)" "$nav"
+    printf '\n'
+
+    # Rendu markdown complet via glow (comme la sélection)
+    rendered=$(printf '%s\n' "# $title" "> $tags | $dates" "" "---" "" "$content" | glow -)
+    content_lines=$(printf '%s\n' "$rendered" | wc -l | tr -d ' ')
+    available=$(( $(tput lines) - 6 ))
+
+    if [[ $content_lines -gt $available ]]; then
+      printf '%s\n' "$rendered" | gum pager
+    else
+      printf '%s\n' "$rendered"
+    fi
+
+    # Navigation clavier
+    printf '\n'
+    hints=""
+    [[ $idx -gt 1 ]] && hints+="← Précédent  "
+    [[ $idx -lt $total ]] && hints+="→ Suivant  "
+    hints+="q Retour"
+    gum style --foreground 245 "$hints"
+
+    while true; do
+      read -k 1 key 2>/dev/null
+      if [[ "$key" == $'\e' ]]; then
+        read -k 1 key 2>/dev/null
+        read -k 1 key 2>/dev/null
+        case "$key" in
+          C) [[ $idx -lt $total ]] && idx=$(( idx + 1 )); break ;;
+          D) [[ $idx -gt 1 ]] && idx=$(( idx - 1 )); break ;;
+        esac
+      elif [[ "$key" == "q" || "$key" == "Q" ]]; then
+        return
+      fi
+    done
+  done
+}
+
+while true; do
+  action=$(gum choose --header "sqlnote" \
+    "Parcourir les notes" \
+    "Mode parcours" \
+    "Filtrer par tag" \
+    "Rechercher" \
+    "Quitter") || exit 0
+
+  case "$action" in
+    "Parcourir les notes") list_notes ;;
+    "Mode parcours") browse_notes ;;
+    "Filtrer par tag") filter_by_tag ;;
+    "Rechercher") search_notes ;;
+    "Quitter") exit 0 ;;
+  esac
+done
